@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+data/
+*.ckpt
+*.bin
+*.safetensors
+wandb/
+.ipynb_checkpoints/
+results/*.json
+!results/.gitkeep
