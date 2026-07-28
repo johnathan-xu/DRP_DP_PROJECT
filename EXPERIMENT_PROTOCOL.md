@@ -7,15 +7,15 @@ rerunning the comparison fairly if it affects the conclusion.
 Model & Data
 Model: distilbert/distilgpt2
 Dataset: GEM/e2e_nlg
-Splits: official train / validation / test splits as provided by the dataset (confirm exact split names when loading — record here once verified: train=___, validation=___, test=___)
+Splits: official E2E splits: train, validation, test. Challenge/sample splits are not used.
 Test data is reserved for final reported numbers only. All tuning (LoRA rank, learning rate, clip norm, epochs, generation settings) uses the validation split.
 Prompt Format
-<MR> {meaning_representation} <SEP> {target} <EOS>
+<MR> {meaning_representation} <SEP> {target}{tokenizer.eos_token}
 
 Example:
 
-<MR> name[The Eagle], food[French], area[riverside] <SEP> The Eagle is a French restaurant by the riverside. <EOS>
-<MR>, <SEP>, <EOS> are added as special tokens to the tokenizer vocabulary (not left as plain text), via tokenizer.add_special_tokens(...). Model embeddings must be resized (model.resize_token_embeddings(len(tokenizer))) after adding tokens. Everyone must do this identically or token IDs will not match across code.
+<MR> name[The Eagle], food[French], area[riverside] <SEP> The Eagle is a French restaurant by the riverside.<|endoftext|>
+<MR> and <SEP> are added as special tokens to the tokenizer vocabulary (not left as plain text), via tokenizer.add_special_tokens(...). Model embeddings must be resized (model.resize_token_embeddings(len(tokenizer))) after adding tokens. Everyone must do this identically or token IDs will not match across code. The tokenizer's existing EOS token is appended to every target; do not add a second literal <EOS> token.
 Tokenizer & Sequence Handling
 Tokenizer: DistilGPT2 tokenizer (AutoTokenizer.from_pretrained("distilbert/distilgpt2"))
 Padding token: EOS token (tokenizer.pad_token = tokenizer.eos_token)
@@ -24,10 +24,10 @@ Default max sequence length: 128
 Context-length study values: 64, 128, 256 (Phase 4 only — all other experiments use 128)
 Label Masking
 
-Prompt tokens (everything through and including <SEP>) are masked out of the loss. Only the target sentence and <EOS> contribute to loss.
+Prompt tokens (everything through and including <SEP>) are masked out of the loss. Only the target sentence and the tokenizer's existing EOS token contribute to loss.
 
-Input IDs:  <MR> ...meaning representation... <SEP>  The Eagle is a French restaurant...  <EOS>
-Labels:     -100  -100 ... -100              -100    The Eagle is a French restaurant...  <EOS>
+Input IDs:  <MR> ...meaning representation... <SEP>  The Eagle is a French restaurant...  <tokenizer EOS>
+Labels:     -100  -100 ... -100              -100    The Eagle is a French restaurant...  <tokenizer EOS>
 
 -100 is PyTorch's ignore-index for CrossEntropyLoss — the model is trained to generate the target from the MR, not to reconstruct the prompt.
 
