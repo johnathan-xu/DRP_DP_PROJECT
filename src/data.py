@@ -123,6 +123,43 @@ def load_e2e_splits(*, max_seq_len: int = 128, dataset_name: str = DATASET_NAME)
     return processed_splits, tokenizer
 
 
+def build_lora_model(
+    *, max_seq_len: int, lora_r: int, lora_alpha: int, lora_dropout: float
+):
+    """Load E2E splits/tokenizer and return a LoRA-wrapped DistilGPT2 model.
+
+    Both the private and non-private training scripts call this so they share
+    identical tokenizer/embedding/LoRA configuration. Returns
+    ``(model, tokenizer, splits)``.
+    """
+    try:
+        from peft import LoraConfig, TaskType, get_peft_model
+        from transformers import AutoModelForCausalLM
+    except ImportError as error:
+        raise ImportError(
+            "Install training dependencies with: python -m pip install peft accelerate"
+        ) from error
+
+    splits, tokenizer = load_e2e_splits(max_seq_len=max_seq_len)
+    model = AutoModelForCausalLM.from_pretrained(MODEL_NAME)
+    # The data module adds <MR> and <SEP>, so the model must expose matching
+    # embedding rows before the adapter is attached and training begins.
+    model.resize_token_embeddings(len(tokenizer))
+    model.config.pad_token_id = tokenizer.pad_token_id
+    lora_config = LoraConfig(
+        task_type=TaskType.CAUSAL_LM,
+        r=lora_r,
+        lora_alpha=lora_alpha,
+        lora_dropout=lora_dropout,
+        target_modules=["c_attn", "c_proj"],
+        # GPT-2 uses its Conv1D projection wrapper rather than nn.Linear.
+        fan_in_fan_out=True,
+        bias="none",
+    )
+    model = get_peft_model(model, lora_config)
+    return model, tokenizer, splits
+
+
 def main() -> None:
     """Print split sizes and one decoded input/target for a manual smoke test."""
     parser = argparse.ArgumentParser()

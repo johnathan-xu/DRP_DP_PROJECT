@@ -19,7 +19,7 @@ from typing import Any
 
 import numpy as np
 
-from src.data import MODEL_NAME, configure_tokenizer, load_e2e_splits
+from src.data import build_lora_model
 
 
 def set_seed(seed: int) -> None:
@@ -76,9 +76,7 @@ def main() -> None:
 
     try:
         import torch
-        from peft import LoraConfig, TaskType, get_peft_model
         from torch.utils.data import DataLoader
-        from transformers import AutoModelForCausalLM
     except ImportError as error:
         raise ImportError(
             "Install training dependencies with: python -m pip install peft accelerate"
@@ -89,30 +87,18 @@ def main() -> None:
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
 
-    splits, tokenizer = load_e2e_splits(max_seq_len=args.max_seq_len)
+    model, tokenizer, splits = build_lora_model(
+        max_seq_len=args.max_seq_len,
+        lora_r=args.lora_r,
+        lora_alpha=args.lora_alpha,
+        lora_dropout=args.lora_dropout,
+    )
     train_dataset = _select_samples(splits["train"], args.max_train_samples)
     train_dataset = train_dataset.with_format(
         "torch", columns=["input_ids", "attention_mask", "labels"]
     )
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
-
-    model = AutoModelForCausalLM.from_pretrained(MODEL_NAME)
-    # The data module adds <MR> and <SEP>, so the model must expose matching
-    # embedding rows before the adapter is attached and training begins.
-    configure_tokenizer(tokenizer)
-    model.resize_token_embeddings(len(tokenizer))
-    model.config.pad_token_id = tokenizer.pad_token_id
-    lora_config = LoraConfig(
-        task_type=TaskType.CAUSAL_LM,
-        r=args.lora_r,
-        lora_alpha=args.lora_alpha,
-        lora_dropout=args.lora_dropout,
-        target_modules=["c_attn", "c_proj"],
-        # GPT-2 uses its Conv1D projection wrapper rather than nn.Linear.
-        fan_in_fan_out=True,
-        bias="none",
-    )
-    model = get_peft_model(model, lora_config).to(device)
+    model = model.to(device)
     trainable_parameters = sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)
     optimizer = torch.optim.AdamW(
         (parameter for parameter in model.parameters() if parameter.requires_grad),
