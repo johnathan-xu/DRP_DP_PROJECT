@@ -119,9 +119,11 @@ def main() -> None:
         from opacus import PrivacyEngine
         from opacus.utils.batch_memory_manager import BatchMemoryManager
         from torch.utils.data import DataLoader
+        from torch.utils.tensorboard import SummaryWriter
     except ImportError as error:
         raise ImportError(
-            "Install training dependencies with: python -m pip install peft accelerate opacus"
+            "Install training dependencies with: "
+            "python -m pip install peft accelerate opacus tensorboard"
         ) from error
 
     set_seed(args.seed)
@@ -174,6 +176,11 @@ def main() -> None:
     # full-epoch runs, an upper bound when --max-train-steps stops early.
     logical_steps_per_epoch = len(private_train_loader)
 
+    writer = SummaryWriter(log_dir=str(args.output_dir / "tensorboard"))
+    # noise_multiplier is fixed for the whole run (calibrated once above), so
+    # it's a single value, not a curve.
+    writer.add_scalar("dp/noise_multiplier", optimizer.noise_multiplier, 0)
+
     model.train()
     losses: list[float] = []
     completed_epochs = 0
@@ -211,17 +218,24 @@ def main() -> None:
                 optimizer.zero_grad()
                 output = model(**batch)
                 loss = output.loss
-                losses.append(loss.detach().item())
-                epoch_losses.append(loss.detach().item())
+                loss_value = loss.detach().item()
+                losses.append(loss_value)
+                epoch_losses.append(loss_value)
                 loss.backward()
                 optimizer.step()
                 physical_steps += 1
+                writer.add_scalar("loss/train_step", loss_value, physical_steps)
                 if max_physical_steps and physical_steps >= max_physical_steps:
                     stopped_early = True
                     break
         completed_epochs += 1
         epoch_loss = sum(epoch_losses) / len(epoch_losses) if epoch_losses else None
         print(f"Epoch {completed_epochs}/{args.epochs} mean loss: {epoch_loss}")
+        if epoch_loss is not None:
+            writer.add_scalar("loss/train_epoch_mean", epoch_loss, completed_epochs)
+        # get_epsilon() re-walks the accountant's full step history, so it's
+        # logged once per epoch rather than every step to keep the overhead down.
+        writer.add_scalar("dp/epsilon_so_far", privacy_engine.get_epsilon(args.delta), completed_epochs)
         if stopped_early:
             break
 
@@ -235,6 +249,8 @@ def main() -> None:
         if stopped_early
         else logical_steps_per_epoch * completed_epochs
     )
+
+    writer.close()
 
     elapsed_seconds = time.perf_counter() - start_time
     args.output_dir.mkdir(parents=True, exist_ok=True)
