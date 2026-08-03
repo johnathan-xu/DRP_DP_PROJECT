@@ -196,16 +196,18 @@ def main() -> None:
                 # to a raw list of zero-length tensors instead of a dict.
                 if not isinstance(batch, dict):
                     batch = dict(zip(_BATCH_FIELDS, batch, strict=True))
-                is_empty_batch = batch["input_ids"].shape[0] == 0
+                if batch["input_ids"].shape[0] == 0:
+                    # An empty batch contributes nothing to the clipped
+                    # gradient sum, so skip it rather than forward through
+                    # GPT-2: its attention_mask.view(batch_size, -1) call
+                    # can't reshape a 0-element tensor (the -1 dim is
+                    # ambiguous when there are no elements at all).
+                    continue
                 batch = {name: value.to(device) for name, value in batch.items()}
                 optimizer.zero_grad()
                 output = model(**batch)
                 loss = output.loss
-                # An empty batch's loss is a meaningless 0/0 mean (NaN); still
-                # step so DP noise is added on schedule, but don't let it
-                # poison the reported average training loss.
-                if not is_empty_batch:
-                    losses.append(loss.detach().item())
+                losses.append(loss.detach().item())
                 loss.backward()
                 optimizer.step()
                 physical_steps += 1
@@ -216,9 +218,11 @@ def main() -> None:
         if stopped_early:
             break
 
-    # Exact for full runs; an approximation if --max-train-steps stopped
-    # training mid-epoch, since logical-batch sizes vary stochastically
-    # around effective_batch_size under Poisson sampling.
+    # An estimate, not an exact count: logical-batch sizes vary stochastically
+    # around effective_batch_size under Poisson sampling, any batch that
+    # happened to be empty was skipped above (no real optimizer.step()), and
+    # --max-train-steps stopping mid-epoch only approximates the logical-step
+    # cutoff in physical micro-batches.
     optimizer_steps = (
         min(args.max_train_steps, logical_steps_per_epoch * args.epochs)
         if stopped_early
