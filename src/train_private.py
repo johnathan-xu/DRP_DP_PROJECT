@@ -15,11 +15,41 @@ import json
 import random
 import time
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 
 from src.data import build_lora_model
 from src.train import _select_samples
+
+_BATCH_FIELDS = ("input_ids", "attention_mask", "labels")
+
+
+class _TupleDataset:
+    """Adapts a dict-yielding dataset to tuple-yielding.
+
+    Opacus's DPDataLoader infers per-field shape/dtype for empty (Poisson-
+    sampled) batches by iterating ``dataset[0]``, assuming a tuple/list item.
+    Iterating a dict instead yields its string keys, producing a bogus
+    placeholder dtype and crashing if the very first batch drawn is empty.
+    """
+
+    def __init__(self, dataset: Any) -> None:
+        self._dataset = dataset
+
+    def __len__(self) -> int:
+        return len(self._dataset)
+
+    def __getitem__(self, index: int) -> tuple[Any, ...]:
+        example = self._dataset[index]
+        return tuple(example[field] for field in _BATCH_FIELDS)
+
+
+def _collate_batch(examples: list[tuple[Any, ...]]) -> dict[str, Any]:
+    import torch
+
+    columns = zip(*examples, strict=True)
+    return {field: torch.stack(column) for field, column in zip(_BATCH_FIELDS, columns, strict=True)}
 
 
 def set_seed(seed: int) -> None:
@@ -113,7 +143,12 @@ def main() -> None:
     # Opacus treats this DataLoader's batch_size as the logical (Poisson-sampled)
     # batch used for noise calibration; physical micro-batching happens below via
     # BatchMemoryManager, not gradient_accumulation_steps.
-    train_loader = DataLoader(train_dataset, batch_size=effective_batch_size, shuffle=True)
+    train_loader = DataLoader(
+        _TupleDataset(train_dataset),
+        batch_size=effective_batch_size,
+        shuffle=True,
+        collate_fn=_collate_batch,
+    )
     model = model.to(device)
     trainable_parameters = sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)
     optimizer = torch.optim.AdamW(
@@ -149,17 +184,28 @@ def main() -> None:
     stopped_early = False
     start_time = time.perf_counter()
     for _ in range(args.epochs):
+        print(f"Epoch {completed_epochs + 1}/{args.epochs} (logical steps: {logical_steps_per_epoch})")
         with BatchMemoryManager(
             data_loader=private_train_loader,
             max_physical_batch_size=args.batch_size,
             optimizer=optimizer,
         ) as memory_safe_loader:
             for batch in memory_safe_loader:
+                # Poisson sampling can draw an empty batch. If that happens
+                # before any real batch has been collated, Opacus falls back
+                # to a raw list of zero-length tensors instead of a dict.
+                if not isinstance(batch, dict):
+                    batch = dict(zip(_BATCH_FIELDS, batch, strict=True))
+                is_empty_batch = batch["input_ids"].shape[0] == 0
                 batch = {name: value.to(device) for name, value in batch.items()}
                 optimizer.zero_grad()
                 output = model(**batch)
                 loss = output.loss
-                losses.append(loss.detach().item())
+                # An empty batch's loss is a meaningless 0/0 mean (NaN); still
+                # step so DP noise is added on schedule, but don't let it
+                # poison the reported average training loss.
+                if not is_empty_batch:
+                    losses.append(loss.detach().item())
                 loss.backward()
                 optimizer.step()
                 physical_steps += 1
@@ -210,7 +256,7 @@ def main() -> None:
         "bleu": None,
         "rouge_l": None,
         "perplexity": None,
-        "train_loss": sum(losses) / len(losses),
+        "train_loss": sum(losses) / len(losses) if losses else None,
         "train_seconds": round(elapsed_seconds, 2),
         "peak_gpu_memory_mb": peak_memory_mb,
         "device": str(device),
