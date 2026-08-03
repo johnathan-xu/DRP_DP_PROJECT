@@ -165,7 +165,10 @@ def main() -> None:
         target_delta=args.delta,
         epochs=args.epochs,
         max_grad_norm=args.clipping_norm,
-        noise_generator=torch.Generator().manual_seed(args.seed),
+        # The noise generator's device must match the model/gradients' device
+        # (torch.normal requires it), so it can't just default to CPU once
+        # training moves to GPU.
+        noise_generator=torch.Generator(device=device).manual_seed(args.seed),
     )
     # Expected number of logical (Poisson-sampled) steps per epoch; exact for
     # full-epoch runs, an upper bound when --max-train-steps stops early.
