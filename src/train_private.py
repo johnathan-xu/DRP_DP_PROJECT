@@ -185,6 +185,7 @@ def main() -> None:
     start_time = time.perf_counter()
     for _ in range(args.epochs):
         print(f"Epoch {completed_epochs + 1}/{args.epochs} (logical steps: {logical_steps_per_epoch})")
+        epoch_losses: list[float] = []
         with BatchMemoryManager(
             data_loader=private_train_loader,
             max_physical_batch_size=args.batch_size,
@@ -208,6 +209,7 @@ def main() -> None:
                 output = model(**batch)
                 loss = output.loss
                 losses.append(loss.detach().item())
+                epoch_losses.append(loss.detach().item())
                 loss.backward()
                 optimizer.step()
                 physical_steps += 1
@@ -215,6 +217,8 @@ def main() -> None:
                     stopped_early = True
                     break
         completed_epochs += 1
+        epoch_loss = sum(epoch_losses) / len(epoch_losses) if epoch_losses else None
+        print(f"Epoch {completed_epochs}/{args.epochs} mean loss: {epoch_loss}")
         if stopped_early:
             break
 
