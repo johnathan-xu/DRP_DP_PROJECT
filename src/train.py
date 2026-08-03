@@ -56,6 +56,12 @@ def parse_args() -> argparse.Namespace:
         default=4,
         help="Stop after this many optimizer steps; use 0 for no step limit.",
     )
+    parser.add_argument(
+        "--max-eval-samples",
+        type=int,
+        default=64,
+        help="Use 0 for the full validation split; default is a cheap smoke check.",
+    )
     parser.add_argument("--output-dir", type=Path, default=Path("artifacts/lora_smoke"))
     parser.add_argument("--result-file", type=Path, default=Path("results/lora_smoke.json"))
     return parser.parse_args()
@@ -67,6 +73,28 @@ def _select_samples(dataset: Any, maximum: int):
     if maximum == 0:
         return dataset
     return dataset.select(range(min(maximum, len(dataset))))
+
+
+def _evaluate_loss(model: Any, dataset: Any, batch_size: int, device: Any) -> float | None:
+    """Mean loss over `dataset` in eval mode; restores the prior train/eval mode after.
+
+    Shared by train.py and train_private.py so validation is computed
+    identically for both.
+    """
+    import torch
+    from torch.utils.data import DataLoader
+
+    was_training = model.training
+    model.eval()
+    losses: list[float] = []
+    loader = DataLoader(dataset, batch_size=batch_size)
+    with torch.no_grad():
+        for batch in loader:
+            batch = {name: value.to(device) for name, value in batch.items()}
+            losses.append(model(**batch).loss.item())
+    if was_training:
+        model.train()
+    return sum(losses) / len(losses) if losses else None
 
 
 def main() -> None:
@@ -98,6 +126,10 @@ def main() -> None:
         "torch", columns=["input_ids", "attention_mask", "labels"]
     )
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
+    val_dataset = _select_samples(splits["validation"], args.max_eval_samples)
+    val_dataset = val_dataset.with_format(
+        "torch", columns=["input_ids", "attention_mask", "labels"]
+    )
     model = model.to(device)
     trainable_parameters = sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)
     optimizer = torch.optim.AdamW(
@@ -109,8 +141,9 @@ def main() -> None:
     optimizer.zero_grad(set_to_none=True)
     losses: list[float] = []
     optimizer_steps = 0
+    validation_loss = None
     start_time = time.perf_counter()
-    for _ in range(args.epochs):
+    for epoch_index in range(args.epochs):
         for batch_index, batch in enumerate(train_loader):
             batch = {name: value.to(device) for name, value in batch.items()}
             output = model(**batch)
@@ -126,6 +159,8 @@ def main() -> None:
                 optimizer_steps += 1
                 if args.max_train_steps and optimizer_steps >= args.max_train_steps:
                     break
+        validation_loss = _evaluate_loss(model, val_dataset, args.batch_size, device)
+        print(f"Epoch {epoch_index + 1}/{args.epochs} validation loss: {validation_loss}")
         if args.max_train_steps and optimizer_steps >= args.max_train_steps:
             break
 
@@ -160,6 +195,7 @@ def main() -> None:
         "rouge_l": None,
         "perplexity": None,
         "train_loss": sum(losses) / len(losses),
+        "validation_loss": validation_loss,
         "train_seconds": round(elapsed_seconds, 2),
         "peak_gpu_memory_mb": peak_memory_mb,
         "device": str(device),

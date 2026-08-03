@@ -20,7 +20,7 @@ from typing import Any
 import numpy as np
 
 from src.data import build_lora_model
-from src.train import _select_samples
+from src.train import _evaluate_loss, _select_samples
 
 _BATCH_FIELDS = ("input_ids", "attention_mask", "labels")
 
@@ -98,6 +98,12 @@ def parse_args() -> argparse.Namespace:
         default=4,
         help="Stop after this many logical (private) optimizer steps; use 0 for no step limit.",
     )
+    parser.add_argument(
+        "--max-eval-samples",
+        type=int,
+        default=64,
+        help="Use 0 for the full validation split; default is a cheap smoke check.",
+    )
     parser.add_argument("--output-dir", type=Path, default=Path("artifacts/dp_lora_smoke"))
     parser.add_argument("--result-file", type=Path, default=Path("results/dp_lora_smoke.json"))
     return parser.parse_args()
@@ -139,6 +145,10 @@ def main() -> None:
     )
     train_dataset = _select_samples(splits["train"], args.max_train_samples)
     train_dataset = train_dataset.with_format(
+        "torch", columns=["input_ids", "attention_mask", "labels"]
+    )
+    val_dataset = _select_samples(splits["validation"], args.max_eval_samples)
+    val_dataset = val_dataset.with_format(
         "torch", columns=["input_ids", "attention_mask", "labels"]
     )
     effective_batch_size = args.batch_size * args.gradient_accumulation_steps
@@ -185,6 +195,7 @@ def main() -> None:
     losses: list[float] = []
     completed_epochs = 0
     physical_steps = 0
+    validation_loss = None
     # --max-train-steps counts logical (private) steps, but Opacus's
     # Poisson-sampled logical-batch boundaries aren't cheaply observable from
     # this loop, so approximate the cutoff in physical micro-batches instead.
@@ -236,6 +247,13 @@ def main() -> None:
         # get_epsilon() re-walks the accountant's full step history, so it's
         # logged once per epoch rather than every step to keep the overhead down.
         writer.add_scalar("dp/epsilon_so_far", privacy_engine.get_epsilon(args.delta), completed_epochs)
+        # Evaluate the underlying peft model directly, bypassing Opacus's
+        # GradSampleModule wrapper: no backward pass happens here, so its
+        # per-sample-grad hooks would only add overhead.
+        validation_loss = _evaluate_loss(model._module, val_dataset, args.batch_size, device)
+        print(f"Epoch {completed_epochs}/{args.epochs} validation loss: {validation_loss}")
+        if validation_loss is not None:
+            writer.add_scalar("loss/validation_epoch_mean", validation_loss, completed_epochs)
         if stopped_early:
             break
 
@@ -284,6 +302,7 @@ def main() -> None:
         "rouge_l": None,
         "perplexity": None,
         "train_loss": sum(losses) / len(losses) if losses else None,
+        "validation_loss": validation_loss,
         "train_seconds": round(elapsed_seconds, 2),
         "peak_gpu_memory_mb": peak_memory_mb,
         "device": str(device),
