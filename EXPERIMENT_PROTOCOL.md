@@ -43,6 +43,7 @@ Dropout: 0.0
 Target modules (full baseline / full DP-LoRA): c_attn, c_proj
 DistilGPT2 has 6 transformer blocks (indices 0–5). "Last block only" in the subset study means block index 5 — LoRA applied only to c_attn/c_proj within that block.
 LM-head only: LoRA (or direct fine-tuning, decide and record which) applied only to lm_head.
+Runner interface: `--lora-scope full`, `--lora-scope last-block`, or `--lora-scope lm-head`. The subset study uses the same DP settings as the other shared comparisons, including ε = 4.
 Differential Privacy Settings
 Delta (δ): 1e-5
 Privacy accountant: PRV accountant (confirm this is what your Opacus version defaults to, and pin the Opacus version below — do not mix accountants across runs being compared)

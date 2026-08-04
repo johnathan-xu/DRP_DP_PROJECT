@@ -14,7 +14,7 @@
 set -euo pipefail
 
 cd "${SLURM_SUBMIT_DIR}"
-source .venv/bin/activate
+source scripts/activate_snorlax_env.sh
 
 python - <<'PY'
 import torch

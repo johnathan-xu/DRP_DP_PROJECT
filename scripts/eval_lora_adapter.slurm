@@ -19,7 +19,7 @@ if [ "$#" -lt 1 ] || [ "$#" -gt 4 ]; then
 fi
 
 cd "${SLURM_SUBMIT_DIR}"
-source .venv/bin/activate
+source scripts/activate_snorlax_env.sh
 adapter_dir="$1"
 method="${2:-lora}"
 epsilon="${3:-}"

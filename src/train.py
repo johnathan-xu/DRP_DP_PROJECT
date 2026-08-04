@@ -4,7 +4,7 @@ Non-private smoke test:
     python -m src.train --max-train-samples 16 --max-train-steps 1
 
 Private smoke test:
-    python -m src.train --dp --target-epsilon 8 --max-train-samples 16 \
+    python -m src.train --dp --target-epsilon 4 --max-train-samples 16 \
       --max-train-steps 2 --epochs 1 --batch-size 4
 """
 
@@ -50,6 +50,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lora-alpha", type=int, default=16)
     parser.add_argument("--lora-dropout", type=float, default=0.0)
     parser.add_argument(
+        "--lora-scope",
+        choices=["full", "last-block", "lm-head"],
+        default="full",
+        help="Train LoRA in all transformer blocks, only block 5, or only lm_head.",
+    )
+    parser.add_argument(
         "--max-train-samples",
         type=int,
         default=64,
@@ -84,6 +90,23 @@ def assert_only_lora_trainable(model: Any) -> list[str]:
     return names
 
 
+def lora_target_modules(scope: str) -> list[str]:
+    """Return exact PEFT target-module names for a documented LoRA subset."""
+    targets = {
+        "full": ["c_attn", "c_proj"],
+        "last-block": [
+            "transformer.h.5.attn.c_attn",
+            "transformer.h.5.attn.c_proj",
+            "transformer.h.5.mlp.c_proj",
+        ],
+        "lm-head": ["lm_head"],
+    }
+    try:
+        return targets[scope]
+    except KeyError as error:
+        raise ValueError(f"Unknown LoRA scope: {scope}") from error
+
+
 def _build_lora_model(args: argparse.Namespace, tokenizer: Any):
     from peft import LoraConfig, TaskType, get_peft_model
     from transformers import AutoModelForCausalLM
@@ -96,7 +119,7 @@ def _build_lora_model(args: argparse.Namespace, tokenizer: Any):
         r=args.lora_r,
         lora_alpha=args.lora_alpha,
         lora_dropout=args.lora_dropout,
-        target_modules=["c_attn", "c_proj"],
+        target_modules=lora_target_modules(args.lora_scope),
         fan_in_fan_out=True,
         bias="none",
     )
@@ -197,7 +220,11 @@ def main() -> None:
         else 0.0
     )
     result = {
-        "method": "dp-lora" if args.dp else "lora",
+        "method": (
+            ("dp-lora" if args.lora_scope == "full" else f"dp-lora-{args.lora_scope}")
+            if args.dp
+            else ("lora" if args.lora_scope == "full" else f"lora-{args.lora_scope}")
+        ),
         "private": args.dp,
         "target_epsilon": args.target_epsilon if args.dp else None,
         "reported_epsilon": reported_epsilon,
@@ -208,6 +235,8 @@ def main() -> None:
         "poisson_sampling": args.dp,
         "secure_rng": False if args.dp else None,
         "seq_len": args.max_seq_len,
+        "lora_scope": args.lora_scope,
+        "lora_target_modules": lora_target_modules(args.lora_scope),
         "trainable_parameters": trainable_parameters,
         "trainable_parameter_names": trainable_names,
         "effective_batch_size": args.batch_size * args.gradient_accumulation_steps,
