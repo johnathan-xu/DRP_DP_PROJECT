@@ -10,4 +10,5 @@ wandb/
 artifacts/
 .ipynb_checkpoints/
 results/*.json
+results/*.jsonl
 !results/.gitkeep
