@@ -19,6 +19,15 @@ from src.data import DATASET_NAME, MODEL_NAME, configure_tokenizer, format_promp
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Generate and evaluate a LoRA adapter on E2E NLG.")
     parser.add_argument("--adapter-dir", type=Path, required=True)
+    parser.add_argument("--method", default="lora", help="Method label recorded with metrics.")
+    parser.add_argument("--private", action="store_true", help="Mark this evaluation as a DP run.")
+    parser.add_argument("--target-epsilon", type=float, default=None)
+    parser.add_argument(
+        "--training-result",
+        type=Path,
+        default=None,
+        help="Optional training JSON to merge privacy/runtime metadata into this result row.",
+    )
     parser.add_argument("--max-examples", type=int, default=100, help="Use 0 for all test examples.")
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--max-seq-len", type=int, default=128)
@@ -187,8 +196,9 @@ def main() -> None:
     )
     metrics.update(
         {
-            "method": "lora",
-            "private": False,
+            "method": args.method,
+            "private": args.private,
+            "target_epsilon": args.target_epsilon,
             "adapter_dir": str(args.adapter_dir),
             "split": "test",
             "examples": len(raw_test),
@@ -199,6 +209,32 @@ def main() -> None:
             "device": str(device),
         }
     )
+    if args.training_result is not None:
+        training_metadata = json.loads(args.training_result.read_text(encoding="utf-8"))
+        for key in (
+            "target_epsilon",
+            "reported_epsilon",
+            "delta",
+            "noise_multiplier",
+            "clipping_norm",
+            "accountant",
+            "poisson_sampling",
+            "secure_rng",
+            "trainable_parameters",
+            "effective_batch_size",
+            "physical_batch_size",
+            "dataset_size",
+            "private_steps",
+            "optimizer_steps",
+            "epochs",
+            "learning_rate",
+            "seed",
+            "train_loss",
+            "train_seconds",
+            "peak_gpu_memory_mb",
+        ):
+            if key in training_metadata:
+                metrics[key] = training_metadata[key]
     args.output_file.parent.mkdir(parents=True, exist_ok=True)
     with args.output_file.open("w", encoding="utf-8") as output:
         for record in records:

@@ -63,8 +63,8 @@ Computed identically for every run using the shared eval.py / metrics.py — no 
 Software Versions (pin once decided, record here)
 transformers==5.14.1
 peft==0.20.0
-opacus==___
-dp-transformers==___
+opacus==1.6.0
+dp-transformers==1.0.1 (commit f9fae445b1d3bb28355dbaac6720c007abb974ce)
 fastDP (awslabs)==___ or commit hash: ___
 Result Schema (every run logs exactly this)
 json

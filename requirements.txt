@@ -1,6 +1,9 @@
 # Install PyTorch separately with the CUDA wheel appropriate for the allocated GPU.
 accelerate==1.14.0
 datasets==3.6.0
+dp-transformers @ git+https://github.com/microsoft/dp-transformers.git@f9fae445b1d3bb28355dbaac6720c007abb974ce
+matplotlib==3.11.1
+opacus==1.6.0
 peft==0.20.0
 pytest==9.0.2
 sacrebleu==2.6.0
