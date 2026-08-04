@@ -196,7 +196,7 @@ def main() -> None:
                 )
         print(
             f"Resuming from {checkpoint_path} "
-            f"({resume_state['total_steps_completed']}/{resume_state['total_target_steps']} steps done)"
+            f"({resume_state['real_steps_completed']}/{resume_state['total_target_steps']} steps done)"
         )
         random.setstate(resume_state["rng_state"]["python"])
         np.random.set_state(resume_state["rng_state"]["numpy"])
@@ -289,6 +289,21 @@ def main() -> None:
         loss_count = 0
         elapsed_seconds_before = 0.0
 
+    # make_private*() already attached the accountant's own hook to fire on
+    # every real (non-accumulation) optimizer step; wrap it with a plain
+    # counter rather than relying on privacy_engine.accountant's own
+    # bookkeeping for loop control, which is simpler and easier to trust.
+    real_steps_completed = resume_state["real_steps_completed"] if resume_state is not None else 0
+    _accountant_hook = optimizer.step_hook
+
+    def _counting_hook(optim: Any) -> None:
+        nonlocal real_steps_completed
+        real_steps_completed += 1
+        if _accountant_hook is not None:
+            _accountant_hook(optim)
+
+    optimizer.attach_step_hook(_counting_hook)
+
     writer = SummaryWriter(log_dir=str(args.output_dir / "tensorboard"))
     # noise_multiplier is fixed for the whole run (calibrated once, never
     # recalibrated on resume), so it's a single value, not a curve.
@@ -304,7 +319,7 @@ def main() -> None:
             optimizer=optimizer,
             checkpoint_dict={
                 "noise_multiplier": optimizer.noise_multiplier,
-                "total_steps_completed": len(privacy_engine.accountant),
+                "real_steps_completed": real_steps_completed,
                 "total_target_steps": total_target_steps,
                 "loss_sum": loss_sum,
                 "loss_count": loss_count,
@@ -334,9 +349,9 @@ def main() -> None:
     start_time = time.perf_counter()
     hit_step_limit = False
     try:
-        while len(privacy_engine.accountant) < total_target_steps:
+        while real_steps_completed < total_target_steps:
             completed_epochs += 1
-            steps_before = len(privacy_engine.accountant)
+            steps_before = real_steps_completed
             print(f"Pass {completed_epochs} (total steps so far: {steps_before}/{total_target_steps})")
             epoch_loss_sum = 0.0
             epoch_loss_count = 0
@@ -372,7 +387,7 @@ def main() -> None:
                     optimizer.step()
                     session_physical_steps += 1
 
-                    total_steps_now = len(privacy_engine.accountant)
+                    total_steps_now = real_steps_completed
                     writer.add_scalar("loss/train_step", loss_value, total_steps_now)
                     if args.checkpoint_every_steps and total_steps_now % args.checkpoint_every_steps == 0:
                         _save_checkpoint()
@@ -388,7 +403,7 @@ def main() -> None:
                 break
             epoch_loss = epoch_loss_sum / epoch_loss_count if epoch_loss_count else None
             print(f"Pass {completed_epochs} mean loss: {epoch_loss}")
-            total_steps_now = len(privacy_engine.accountant)
+            total_steps_now = real_steps_completed
             if epoch_loss is not None:
                 writer.add_scalar("loss/train_epoch_mean", epoch_loss, total_steps_now)
             # get_epsilon() re-walks the accountant's full step history, so it's
@@ -408,7 +423,7 @@ def main() -> None:
         writer.close()
         raise
 
-    total_steps_completed = len(privacy_engine.accountant)
+    total_steps_completed = real_steps_completed
     if hit_step_limit and total_steps_completed < total_target_steps and args.resume:
         # Hitting --max-train-steps mid-resume isn't real completion: on a
         # fresh run this flag intentionally means "stop here, this smoke test
