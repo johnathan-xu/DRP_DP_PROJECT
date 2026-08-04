@@ -1,0 +1,2 @@
+Experiment,Method,Epsilon,BLEU,ROUGE-L,Peak_GPU_Memory_MB,Train_Time_s
+1_Baseline,LoRA,None,30.7624,0.447292,1003.59,946.97
