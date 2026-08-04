@@ -61,8 +61,8 @@ Primary: BLEU, ROUGE-L
 Secondary: Perplexity
 Computed identically for every run using the shared eval.py / metrics.py — no per-person metric scripts.
 Software Versions (pin once decided, record here)
-transformers==___
-peft==___
+transformers==5.14.1
+peft==0.20.0
 opacus==___
 dp-transformers==___
 fastDP (awslabs)==___ or commit hash: ___

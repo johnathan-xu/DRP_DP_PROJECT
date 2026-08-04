@@ -1,0 +1,7 @@
+# Install PyTorch separately with the CUDA wheel appropriate for the allocated GPU.
+accelerate==1.14.0
+datasets==3.6.0
+peft==0.20.0
+pytest==9.0.2
+sacrebleu==2.6.0
+transformers==5.14.1

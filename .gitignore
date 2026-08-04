@@ -8,6 +8,7 @@ data/
 *.safetensors
 wandb/
 artifacts/
+logs/
 .ipynb_checkpoints/
 results/*.json
 results/*.jsonl
