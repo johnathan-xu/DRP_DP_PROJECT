@@ -194,6 +194,8 @@ def main() -> None:
                     f"{saved_args.get(field)!r}, this invocation has {getattr(args, field)!r}. "
                     "Resuming with a different value would silently corrupt the run."
                 )
+        if 'real_steps_completed' not in resume_state.keys():
+            resume_state['real_steps_completed'] = resume_state['total_steps_completed']
         print(
             f"Resuming from {checkpoint_path} "
             f"({resume_state['real_steps_completed']}/{resume_state['total_target_steps']} steps done)"
