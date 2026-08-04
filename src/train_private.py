@@ -5,7 +5,12 @@ Run a small CPU-safe check first:
 
 Adds DP-SGD (per-sample gradient clipping + calibrated noise) on top of the
 same LoRA setup verified by src/train.py, using Opacus's modern
-PrivacyEngine.make_private_with_epsilon API.
+PrivacyEngine.make_private_with_epsilon API. Long runs checkpoint themselves
+periodically (--checkpoint-every-steps) and on Ctrl+C/SIGTERM, and can be
+continued later with --resume:
+    python -m src.train_private --epsilon 8 --epochs 500 --output-dir artifacts/run1
+    # ...interrupted or killed...
+    python -m src.train_private --epsilon 8 --epochs 500 --output-dir artifacts/run1 --resume
 """
 
 from __future__ import annotations
@@ -13,6 +18,7 @@ from __future__ import annotations
 import argparse
 import json
 import random
+import signal
 import time
 from pathlib import Path
 from typing import Any
@@ -23,6 +29,29 @@ from src.data import build_lora_model
 from src.train import _evaluate_loss, _select_samples
 
 _BATCH_FIELDS = ("input_ids", "attention_mask", "labels")
+
+# Fields that must match between a checkpoint and a --resume invocation: any of
+# these differing would silently change the model architecture, tokenization,
+# or the privacy calibration target mid-run.
+_RESUME_SENSITIVE_ARGS = (
+    "max_seq_len",
+    "epsilon",
+    "delta",
+    "clipping_norm",
+    "lora_r",
+    "lora_alpha",
+    "lora_dropout",
+    "seed",
+    "max_train_samples",
+)
+
+
+class _GracefulExit(Exception):
+    """Raised from a SIGTERM handler so it can be caught alongside KeyboardInterrupt."""
+
+
+def _handle_sigterm(signum: int, frame: Any) -> None:
+    raise _GracefulExit()
 
 
 class _TupleDataset:
@@ -106,6 +135,18 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--output-dir", type=Path, default=Path("artifacts/dp_lora_smoke"))
     parser.add_argument("--result-file", type=Path, default=Path("results/dp_lora_smoke.json"))
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume from the checkpoint at --output-dir/checkpoint.pt.",
+    )
+    parser.add_argument(
+        "--checkpoint-every-steps",
+        type=int,
+        default=2000,
+        help="Save a resumable checkpoint every this many real optimizer steps; 0 to disable "
+        "periodic checkpoints (Ctrl+C/SIGTERM still checkpoints).",
+    )
     return parser.parse_args()
 
 
@@ -119,6 +160,8 @@ def main() -> None:
         raise ValueError("delta must be in (0, 1)")
     if args.clipping_norm <= 0:
         raise ValueError("clipping_norm must be positive")
+    if args.checkpoint_every_steps < 0:
+        raise ValueError("checkpoint_every_steps must be zero or positive")
 
     try:
         import torch
@@ -132,10 +175,45 @@ def main() -> None:
             "python -m pip install peft accelerate opacus tensorboard"
         ) from error
 
-    set_seed(args.seed)
+    checkpoint_path = args.output_dir / "checkpoint.pt"
+    resume_state: dict[str, Any] | None = None
+    if args.resume:
+        if not checkpoint_path.exists():
+            raise FileNotFoundError(
+                f"--resume was passed but no checkpoint found at {checkpoint_path}"
+            )
+        # Lightweight peek at just the bookkeeping fields (not the multi-hundred-MB
+        # model/optimizer tensors, which get (re-)loaded via privacy_engine.load_checkpoint
+        # once the wrapped model/optimizer exist below).
+        resume_state = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        saved_args = resume_state["args"]
+        for field in _RESUME_SENSITIVE_ARGS:
+            if saved_args.get(field) != getattr(args, field):
+                raise ValueError(
+                    f"--resume config mismatch on {field!r}: checkpoint has "
+                    f"{saved_args.get(field)!r}, this invocation has {getattr(args, field)!r}. "
+                    "Resuming with a different value would silently corrupt the run."
+                )
+        print(
+            f"Resuming from {checkpoint_path} "
+            f"({resume_state['total_steps_completed']}/{resume_state['total_target_steps']} steps done)"
+        )
+        random.setstate(resume_state["rng_state"]["python"])
+        np.random.set_state(resume_state["rng_state"]["numpy"])
+        torch.set_rng_state(resume_state["rng_state"]["torch"])
+    elif checkpoint_path.exists():
+        raise FileExistsError(
+            f"{checkpoint_path} already exists but --resume was not passed. "
+            "Pass --resume to continue it, or choose a different --output-dir to start fresh."
+        )
+    else:
+        set_seed(args.seed)
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
+        if resume_state is not None and resume_state["rng_state"]["cuda"] is not None:
+            torch.cuda.set_rng_state_all(resume_state["rng_state"]["cuda"])
 
     model, tokenizer, splits = build_lora_model(
         max_seq_len=args.max_seq_len,
@@ -168,113 +246,195 @@ def main() -> None:
         lr=args.learning_rate,
     )
 
+    noise_generator = torch.Generator(device=device).manual_seed(args.seed)
+    if resume_state is not None:
+        noise_generator.set_state(resume_state["rng_state"]["noise_generator"])
+
     privacy_engine = PrivacyEngine(accountant="prv")
-    model, optimizer, private_train_loader = privacy_engine.make_private_with_epsilon(
-        module=model,
-        optimizer=optimizer,
-        data_loader=train_loader,
-        target_epsilon=args.epsilon,
-        target_delta=args.delta,
-        epochs=args.epochs,
-        max_grad_norm=args.clipping_norm,
-        # The noise generator's device must match the model/gradients' device
-        # (torch.normal requires it), so it can't just default to CPU once
-        # training moves to GPU.
-        noise_generator=torch.Generator(device=device).manual_seed(args.seed),
-    )
-    # Expected number of logical (Poisson-sampled) steps per epoch; exact for
-    # full-epoch runs, an upper bound when --max-train-steps stops early.
-    logical_steps_per_epoch = len(private_train_loader)
+    if resume_state is not None:
+        # Reuse the exact noise_multiplier already calibrated on the original
+        # run. Calling make_private_with_epsilon again here would recalibrate
+        # a *fresh* noise_multiplier as if starting over, silently discarding
+        # however much privacy budget has already been spent.
+        model, optimizer, private_train_loader = privacy_engine.make_private(
+            module=model,
+            optimizer=optimizer,
+            data_loader=train_loader,
+            noise_multiplier=resume_state["noise_multiplier"],
+            max_grad_norm=args.clipping_norm,
+            poisson_sampling=True,
+            noise_generator=noise_generator,
+        )
+        privacy_engine.load_checkpoint(path=checkpoint_path, module=model, optimizer=optimizer)
+        total_target_steps = resume_state["total_target_steps"]
+        loss_sum = resume_state["loss_sum"]
+        loss_count = resume_state["loss_count"]
+        elapsed_seconds_before = resume_state["elapsed_seconds_before"]
+    else:
+        model, optimizer, private_train_loader = privacy_engine.make_private_with_epsilon(
+            module=model,
+            optimizer=optimizer,
+            data_loader=train_loader,
+            target_epsilon=args.epsilon,
+            target_delta=args.delta,
+            epochs=args.epochs,
+            max_grad_norm=args.clipping_norm,
+            noise_generator=noise_generator,
+        )
+        # Poisson-sampled logical steps per pass over the dataset; the target
+        # step budget the original run (and every future --resume of it) is
+        # calibrated for.
+        total_target_steps = len(private_train_loader) * args.epochs
+        loss_sum = 0.0
+        loss_count = 0
+        elapsed_seconds_before = 0.0
 
     writer = SummaryWriter(log_dir=str(args.output_dir / "tensorboard"))
-    # noise_multiplier is fixed for the whole run (calibrated once above), so
-    # it's a single value, not a curve.
+    # noise_multiplier is fixed for the whole run (calibrated once, never
+    # recalibrated on resume), so it's a single value, not a curve.
     writer.add_scalar("dp/noise_multiplier", optimizer.noise_multiplier, 0)
 
+    signal.signal(signal.SIGTERM, _handle_sigterm)
+
+    def _save_checkpoint() -> None:
+        args.output_dir.mkdir(parents=True, exist_ok=True)
+        privacy_engine.save_checkpoint(
+            path=checkpoint_path,
+            module=model,
+            optimizer=optimizer,
+            checkpoint_dict={
+                "noise_multiplier": optimizer.noise_multiplier,
+                "total_steps_completed": len(privacy_engine.accountant),
+                "total_target_steps": total_target_steps,
+                "loss_sum": loss_sum,
+                "loss_count": loss_count,
+                "elapsed_seconds_before": elapsed_seconds_before + (time.perf_counter() - start_time),
+                "rng_state": {
+                    "python": random.getstate(),
+                    "numpy": np.random.get_state(),
+                    "torch": torch.get_rng_state(),
+                    "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+                    "noise_generator": noise_generator.get_state(),
+                },
+                "args": {
+                    **vars(args),
+                    "output_dir": str(args.output_dir),
+                    "result_file": str(args.result_file),
+                },
+            },
+        )
+
     model.train()
-    losses: list[float] = []
-    completed_epochs = 0
-    physical_steps = 0
-    validation_loss = None
-    # --max-train-steps counts logical (private) steps, but Opacus's
-    # Poisson-sampled logical-batch boundaries aren't cheaply observable from
-    # this loop, so approximate the cutoff in physical micro-batches instead.
     max_physical_steps = (
         args.max_train_steps * args.gradient_accumulation_steps if args.max_train_steps else 0
     )
-    stopped_early = False
+    session_physical_steps = 0
+    completed_epochs = 0
+    validation_loss = None
     start_time = time.perf_counter()
-    for _ in range(args.epochs):
-        print(f"Epoch {completed_epochs + 1}/{args.epochs} (logical steps: {logical_steps_per_epoch})")
-        epoch_losses: list[float] = []
-        with BatchMemoryManager(
-            data_loader=private_train_loader,
-            max_physical_batch_size=args.batch_size,
-            optimizer=optimizer,
-        ) as memory_safe_loader:
-            for batch in memory_safe_loader:
-                # Poisson sampling can draw an empty batch. If that happens
-                # before any real batch has been collated, Opacus falls back
-                # to a raw list of zero-length tensors instead of a dict.
-                if not isinstance(batch, dict):
-                    batch = dict(zip(_BATCH_FIELDS, batch, strict=True))
-                if batch["input_ids"].shape[0] == 0:
-                    # An empty batch contributes nothing to the clipped
-                    # gradient sum, so skip it rather than forward through
-                    # GPT-2: its attention_mask.view(batch_size, -1) call
-                    # can't reshape a 0-element tensor (the -1 dim is
-                    # ambiguous when there are no elements at all).
-                    continue
-                batch = {name: value.to(device) for name, value in batch.items()}
-                optimizer.zero_grad()
-                output = model(**batch)
-                loss = output.loss
-                loss_value = loss.detach().item()
-                losses.append(loss_value)
-                epoch_losses.append(loss_value)
-                loss.backward()
-                optimizer.step()
-                physical_steps += 1
-                writer.add_scalar("loss/train_step", loss_value, physical_steps)
-                if max_physical_steps and physical_steps >= max_physical_steps:
-                    stopped_early = True
-                    break
-        completed_epochs += 1
-        epoch_loss = sum(epoch_losses) / len(epoch_losses) if epoch_losses else None
-        print(f"Epoch {completed_epochs}/{args.epochs} mean loss: {epoch_loss}")
-        if epoch_loss is not None:
-            writer.add_scalar("loss/train_epoch_mean", epoch_loss, completed_epochs)
-        # get_epsilon() re-walks the accountant's full step history, so it's
-        # logged once per epoch rather than every step to keep the overhead down.
-        writer.add_scalar("dp/epsilon_so_far", privacy_engine.get_epsilon(args.delta), completed_epochs)
-        # Evaluate the underlying peft model directly, bypassing Opacus's
-        # GradSampleModule wrapper: no backward pass happens here, so its
-        # per-sample-grad hooks would only add overhead.
-        validation_loss = _evaluate_loss(model._module, val_dataset, args.batch_size, device)
-        print(f"Epoch {completed_epochs}/{args.epochs} validation loss: {validation_loss}")
-        if validation_loss is not None:
-            writer.add_scalar("loss/validation_epoch_mean", validation_loss, completed_epochs)
-        if stopped_early:
-            break
+    hit_step_limit = False
+    try:
+        while len(privacy_engine.accountant) < total_target_steps:
+            completed_epochs += 1
+            steps_before = len(privacy_engine.accountant)
+            print(f"Pass {completed_epochs} (total steps so far: {steps_before}/{total_target_steps})")
+            epoch_loss_sum = 0.0
+            epoch_loss_count = 0
+            reached_target_or_limit = False
+            with BatchMemoryManager(
+                data_loader=private_train_loader,
+                max_physical_batch_size=args.batch_size,
+                optimizer=optimizer,
+            ) as memory_safe_loader:
+                for batch in memory_safe_loader:
+                    # Poisson sampling can draw an empty batch. If that happens
+                    # before any real batch has been collated, Opacus falls back
+                    # to a raw list of zero-length tensors instead of a dict.
+                    if not isinstance(batch, dict):
+                        batch = dict(zip(_BATCH_FIELDS, batch, strict=True))
+                    if batch["input_ids"].shape[0] == 0:
+                        # An empty batch contributes nothing to the clipped
+                        # gradient sum, so skip it rather than forward through
+                        # GPT-2: its attention_mask.view(batch_size, -1) call
+                        # can't reshape a 0-element tensor (the -1 dim is
+                        # ambiguous when there are no elements at all).
+                        continue
+                    batch = {name: value.to(device) for name, value in batch.items()}
+                    optimizer.zero_grad()
+                    output = model(**batch)
+                    loss = output.loss
+                    loss_value = loss.detach().item()
+                    loss_sum += loss_value
+                    loss_count += 1
+                    epoch_loss_sum += loss_value
+                    epoch_loss_count += 1
+                    loss.backward()
+                    optimizer.step()
+                    session_physical_steps += 1
 
-    # An estimate, not an exact count: logical-batch sizes vary stochastically
-    # around effective_batch_size under Poisson sampling, any batch that
-    # happened to be empty was skipped above (no real optimizer.step()), and
-    # --max-train-steps stopping mid-epoch only approximates the logical-step
-    # cutoff in physical micro-batches.
-    optimizer_steps = (
-        min(args.max_train_steps, logical_steps_per_epoch * args.epochs)
-        if stopped_early
-        else logical_steps_per_epoch * completed_epochs
-    )
+                    total_steps_now = len(privacy_engine.accountant)
+                    writer.add_scalar("loss/train_step", loss_value, total_steps_now)
+                    if args.checkpoint_every_steps and total_steps_now % args.checkpoint_every_steps == 0:
+                        _save_checkpoint()
+
+                    if max_physical_steps and session_physical_steps >= max_physical_steps:
+                        reached_target_or_limit = True
+                        hit_step_limit = True
+                        break
+                    if total_steps_now >= total_target_steps:
+                        reached_target_or_limit = True
+                        break
+            if reached_target_or_limit:
+                break
+            epoch_loss = epoch_loss_sum / epoch_loss_count if epoch_loss_count else None
+            print(f"Pass {completed_epochs} mean loss: {epoch_loss}")
+            total_steps_now = len(privacy_engine.accountant)
+            if epoch_loss is not None:
+                writer.add_scalar("loss/train_epoch_mean", epoch_loss, total_steps_now)
+            # get_epsilon() re-walks the accountant's full step history, so it's
+            # logged once per pass rather than every step to keep the overhead down.
+            writer.add_scalar("dp/epsilon_so_far", privacy_engine.get_epsilon(args.delta), total_steps_now)
+            # Evaluate the underlying peft model directly, bypassing Opacus's
+            # GradSampleModule wrapper: no backward pass happens here, so its
+            # per-sample-grad hooks would only add overhead.
+            validation_loss = _evaluate_loss(model._module, val_dataset, args.batch_size, device)
+            print(f"Pass {completed_epochs} validation loss: {validation_loss}")
+            if validation_loss is not None:
+                writer.add_scalar("loss/validation_epoch_mean", validation_loss, total_steps_now)
+    except (KeyboardInterrupt, _GracefulExit):
+        print("Interrupted; saving checkpoint before exit...")
+        _save_checkpoint()
+        writer.flush()
+        writer.close()
+        raise
+
+    total_steps_completed = len(privacy_engine.accountant)
+    if hit_step_limit and total_steps_completed < total_target_steps and args.resume:
+        # Hitting --max-train-steps mid-resume isn't real completion: on a
+        # fresh run this flag intentionally means "stop here, this smoke test
+        # is done," but on --resume it's easy to forget to also pass
+        # --max-train-steps 0, which would otherwise silently finalize (and
+        # delete the checkpoint for) a long run that's nowhere near done.
+        print(
+            f"Stopped at --max-train-steps without reaching the full target "
+            f"({total_steps_completed}/{total_target_steps} steps done). Checkpoint saved; "
+            "re-run with --resume (and --max-train-steps 0, for a real run) to continue."
+        )
+        _save_checkpoint()
+        writer.close()
+        return
 
     writer.close()
 
-    elapsed_seconds = time.perf_counter() - start_time
+    elapsed_seconds = elapsed_seconds_before + (time.perf_counter() - start_time)
     args.output_dir.mkdir(parents=True, exist_ok=True)
     # model is wrapped in Opacus's GradSampleModule; save the underlying peft model.
     model._module.save_pretrained(args.output_dir)
     tokenizer.save_pretrained(args.output_dir)
+    # Training finished (either the target step budget was reached, or
+    # --max-train-steps intentionally cut it short) rather than being
+    # interrupted, so the run is "done" — any resumable checkpoint is stale.
+    checkpoint_path.unlink(missing_ok=True)
     peak_memory_mb = (
         round(torch.cuda.max_memory_allocated(device) / (1024**2), 2)
         if device.type == "cuda"
@@ -293,15 +453,15 @@ def main() -> None:
         "effective_batch_size": effective_batch_size,
         "physical_batch_size": args.batch_size,
         "dataset_size": len(train_dataset),
-        "private_steps": optimizer_steps,
-        "optimizer_steps": optimizer_steps,
+        "private_steps": total_steps_completed,
+        "optimizer_steps": total_steps_completed,
         "epochs": args.epochs,
         "learning_rate": args.learning_rate,
         "seed": args.seed,
         "bleu": None,
         "rouge_l": None,
         "perplexity": None,
-        "train_loss": sum(losses) / len(losses) if losses else None,
+        "train_loss": loss_sum / loss_count if loss_count else None,
         "validation_loss": validation_loss,
         "train_seconds": round(elapsed_seconds, 2),
         "peak_gpu_memory_mb": peak_memory_mb,
