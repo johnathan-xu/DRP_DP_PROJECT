@@ -1,0 +1,15 @@
+{
+  "bleu": 30.7624,
+  "rouge_l": 0.447292,
+  "perplexity": 3.625815,
+  "method": "lora",
+  "private": false,
+  "adapter_dir": "artifacts/lora_baseline_seed42_job272254",
+  "split": "test",
+  "examples": 1847,
+  "seq_len": 128,
+  "generation": "greedy",
+  "max_new_tokens": 64,
+  "eval_seconds": 297.67,
+  "device": "cuda"
+}
