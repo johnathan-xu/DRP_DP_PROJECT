@@ -1,2 +1,4 @@
-Experiment,Method,Epsilon,BLEU,ROUGE-L,Peak_GPU_Memory_MB,Train_Time_s
-1_Baseline,LoRA,None,30.7624,0.447292,1003.59,946.97
+Experiment,Method,Epsilon,BLEU,NIST,METEOR,ROUGE_L,CIDEr,Peak_GPU_Memory_MB,Train_Time_s
+1_Privacy_Run,DP-λCGD,4,0.3174,5.2808,0.3617,0.4884,1.6965,1003.59,946.97
+3_SeqLen_64,DP-λCGD,4,0.2553,4.5755,0.3008,0.4470,1.2358,null,7942.26
+3_SeqLen_128,DP-λCGD,4,0.2509,4.4879,0.2963,0.4459,1.2115,null,10584.75
