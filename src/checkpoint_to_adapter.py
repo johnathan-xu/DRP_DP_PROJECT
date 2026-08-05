@@ -13,11 +13,19 @@ saved args (the same config train_private.py persisted for --resume),
 rebuilds the identical base model + tokenizer via build_lora_model, loads
 the checkpointed weights onto it, and writes a normal adapter directory that
 generate.py can load with --adapter-dir. Does not run any optimizer steps.
+
+Also writes a result JSON (default --output-dir/result.json) with the run
+stats already stored in the checkpoint: steps completed, elapsed train time,
+noise_multiplier, target epsilon/delta, etc. reported_epsilon and
+peak_gpu_memory_mb are left null since those are only ever computed live
+against the privacy accountant / CUDA state during an actual training run,
+not stored in the checkpoint itself.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 
 from src.data import build_lora_model
@@ -27,6 +35,12 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument(
+        "--result-file",
+        type=Path,
+        default=None,
+        help="Defaults to --output-dir/result.json.",
+    )
     return parser.parse_args()
 
 
@@ -67,6 +81,7 @@ def main() -> None:
         lora_dropout=saved_args["lora_dropout"],
     )
     _load_module_weights(model, checkpoint["module_state_dict"])
+    trainable_parameters = sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     model.save_pretrained(args.output_dir)
@@ -75,6 +90,40 @@ def main() -> None:
         f"Saved adapter ({checkpoint['real_steps_completed']}/"
         f"{checkpoint['total_target_steps']} steps completed) to {args.output_dir}"
     )
+
+    loss_count = checkpoint["loss_count"]
+    result = {
+        "method": "dp-lora",
+        "private": True,
+        "complete": checkpoint["real_steps_completed"] >= checkpoint["total_target_steps"],
+        "target_epsilon": saved_args["epsilon"],
+        "reported_epsilon": None,
+        "delta": saved_args["delta"],
+        "noise_multiplier": checkpoint["noise_multiplier"],
+        "clipping_norm": saved_args["clipping_norm"],
+        "seq_len": saved_args["max_seq_len"],
+        "trainable_parameters": trainable_parameters,
+        "effective_batch_size": saved_args["batch_size"] * saved_args["gradient_accumulation_steps"],
+        "physical_batch_size": saved_args["batch_size"],
+        "private_steps": checkpoint["real_steps_completed"],
+        "optimizer_steps": checkpoint["real_steps_completed"],
+        "total_target_steps": checkpoint["total_target_steps"],
+        "epochs": saved_args["epochs"],
+        "learning_rate": saved_args["learning_rate"],
+        "seed": saved_args["seed"],
+        "bleu": None,
+        "rouge_l": None,
+        "perplexity": None,
+        "train_loss": checkpoint["loss_sum"] / loss_count if loss_count else None,
+        "validation_loss": None,
+        "train_seconds": round(checkpoint["elapsed_seconds_before"], 2),
+        "peak_gpu_memory_mb": None,
+        "adapter_dir": str(args.output_dir),
+    }
+    result_file = args.result_file or (args.output_dir / "result.json")
+    result_file.parent.mkdir(parents=True, exist_ok=True)
+    result_file.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
+    print(f"Wrote run stats to {result_file}")
 
 
 if __name__ == "__main__":
